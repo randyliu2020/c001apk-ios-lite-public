@@ -88,7 +88,7 @@ jobs:
     runs-on: xcode-27
     timeout-minutes: 40
     env:
-      BUILD_NUMBER: ${{ needs.checks.outputs.build_date }}.4
+      BUILD_NUMBER: ${{ needs.checks.outputs.build_date }}.5
     steps:
       - name: Checkout customization
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6

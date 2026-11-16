@@ -6178,3 +6178,341 @@ index 0000000..e2bf8ec
 +scheme.launch_action.build_configuration = 'Debug'
 +scheme.save_as(project_path, 'GestureSmoke', true)
 +puts 'Created temporary GestureSmoke scheme with Flutter preparation and offline UI gesture cases.'
+diff --git a/apps/flutter/lib/logic/content_filter/content_filter_projection.dart b/apps/flutter/lib/logic/content_filter/content_filter_projection.dart
+index 949ccdf..53d39e4 100644
+--- a/apps/flutter/lib/logic/content_filter/content_filter_projection.dart
++++ b/apps/flutter/lib/logic/content_filter/content_filter_projection.dart
+@@ -128,10 +128,13 @@ class ContentFilterProjection {
+   static FilterMatch? match(Datum data, {FilterScope? scope}) {
+     final legacy = legacyMatch(data);
+     if (legacy != null) return legacy;
++    final service = AppContentFilter.service;
++    // Disabled filtering must not parse card content during UI construction.
++    // Legacy personal blocks above remain independent of this setting.
++    if (service == null || !service.enabled) return null;
+     final actualScope = scope ?? scopeOf(data);
+     if (actualScope == null) return null;
+-    return AppContentFilter.service
+-        ?.evaluate(inputOf(data, scope: actualScope));
++    return service.evaluate(inputOf(data, scope: actualScope));
+   }
+ 
+   static String displayMessage(Datum data) =>
+diff --git a/apps/flutter/lib/utils/markdown_content.dart b/apps/flutter/lib/utils/markdown_content.dart
+index 3432f10..2e7e697 100644
+--- a/apps/flutter/lib/utils/markdown_content.dart
++++ b/apps/flutter/lib/utils/markdown_content.dart
+@@ -20,6 +20,11 @@ class MarkdownContent {
+   static final _cache = <(String, bool, bool, bool, bool), MarkdownContent>{};
+   static int _cachedCharacters = 0;
+   static const _escape = HtmlEscape(HtmlEscapeMode.element);
++  // A negative check only: uncertain input keeps the full normalization/parser.
++  // These markers cover every syntax that _detect can promote to Markdown,
++  // plus HTML/entities and indentation that normalization can turn into syntax.
++  static final _possibleMarkdown =
++      RegExp(r'[`*_~#>\[\]<&\\=+|.()\-\t\r]|^ {4}', multiLine: true);
+ 
+   static MarkdownContent parse(String source,
+       {bool explicit = false,
+@@ -34,6 +39,9 @@ class MarkdownContent {
+     }
+     // Bound synchronous parsing and retained source on scrolling feed cards.
+     if (source.length > 200000) return _plain(source);
++    if (!explicit && !_possibleMarkdown.hasMatch(source)) {
++      return _remember(key, _plain(source));
++    }
+     MarkdownContent result;
+     try {
+       final links = <md.Element>[];
+@@ -97,8 +105,13 @@ class MarkdownContent {
+       // A malformed/unsupported document must not hide the original post.
+       result = _plain(source);
+     }
++    return _remember(key, result);
++  }
++
++  static MarkdownContent _remember(
++      (String, bool, bool, bool, bool) key, MarkdownContent result) {
+     _cache[key] = result;
+-    _cachedCharacters += source.length;
++    _cachedCharacters += key.$1.length;
+     while (_cache.length > 64 || _cachedCharacters > 500000) {
+       _cachedCharacters -= _cache.keys.first.$1.length;
+       _cache.remove(_cache.keys.first);
+diff --git a/apps/flutter/test/content_filter/projection_disabled_test.dart b/apps/flutter/test/content_filter/projection_disabled_test.dart
+new file mode 100644
+--- /dev/null
++++ b/apps/flutter/test/content_filter/projection_disabled_test.dart
+@@ -0,0 +1,158 @@
++import 'dart:io';
++
++import 'package:c001apk_flutter/logic/content_filter/app_content_filter.dart';
++import 'package:c001apk_flutter/logic/content_filter/content_filter_projection.dart';
++import 'package:c001apk_flutter/logic/content_filter/content_filter_rule.dart';
++import 'package:c001apk_flutter/logic/content_filter/content_filter_service.dart';
++import 'package:c001apk_flutter/logic/model/feed/datum.dart';
++import 'package:c001apk_flutter/utils/storage_util.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:hive/hive.dart';
++
++// Reading the body is observable without timing thresholds or parser hooks.
++// A disabled filter must leave both HTML and article JSON untouched.
++class _ObservedBody extends Datum {
++  _ObservedBody({int super.uid = 7, super.tags})
++      : super(
++            entityType: 'feed',
++            id: 42,
++            message: '<p>projection-regression-marker</p>',
++            messageRawOutput: '[{"type":"text","message":"article"}]');
++
++  int bodyReads = 0;
++  int articleReads = 0;
++
++  @override
++  String? get message {
++    bodyReads++;
++    return super.message;
++  }
++
++  @override
++  String? get messageRawOutput {
++    articleReads++;
++    return super.messageRawOutput;
++  }
++}
++
++const _rule = FilterRule(
++    id: 'personal.projection-regression',
++    reason: 'Projection regression fixture',
++    kind: FilterRuleKind.text,
++    groups: [
++      ['projection-regression-marker']
++    ]);
++
++void main() {
++  late Directory temporary;
++  late Box<dynamic> box;
++  late ContentFilterService service;
++  final now = DateTime.utc(2026, 11, 16);
++
++  setUpAll(() async {
++    temporary = await Directory.systemTemp.createTemp('projection-disabled-');
++    Hive.init(temporary.path);
++    GStorage.blackList = await Hive.openBox('blackList');
++    box = await Hive.openBox('projectionDisabled');
++  });
++
++  setUp(() async {
++    await box.clear();
++    await GStorage.blackList.clear();
++    // Keep this unit test offline even when it enables the real service.
++    await box.put('lastCheckedAt', now.toIso8601String());
++    service = ContentFilterService(box, now: () => now);
++    AppContentFilter.service = service;
++  });
++
++  tearDown(() {
++    service.dispose();
++    AppContentFilter.service = null;
++  });
++
++  tearDownAll(() async {
++    await Hive.close();
++    await temporary.delete(recursive: true);
++  });
++
++  test('disabled card filtering does not read HTML or article bodies', () {
++    final data = _ObservedBody();
++    expect(service.enabled, isFalse);
++    for (var build = 0; build < 20; build++) {
++      expect(ContentFilterProjection.match(data), isNull);
++    }
++    expect(data.bodyReads, 0);
++    expect(data.articleReads, 0);
++  });
++
++  test('missing service leaves card bodies untouched', () {
++    AppContentFilter.service = null;
++    final data = _ObservedBody();
++    expect(ContentFilterProjection.match(data), isNull);
++    expect(data.bodyReads, 0);
++    expect(data.articleReads, 0);
++  });
++
++  test('legacy author and topic blocks survive disabled or missing service',
++      () async {
++    await GStorage.blackList.put(BlackListBoxKey.userBlackList, ['8']);
++    await GStorage.blackList
++        .put(BlackListBoxKey.topicBlackList, ['legacy-topic']);
++    for (final current in <ContentFilterService?>[service, null]) {
++      AppContentFilter.service = current;
++      final author = _ObservedBody(uid: 8);
++      final topic = _ObservedBody(tags: 'legacy-topic');
++      expect(ContentFilterProjection.match(author)?.ruleId, 'legacy.user:8');
++      expect(ContentFilterProjection.match(topic)?.ruleId,
++          'legacy.topic:legacy-topic');
++      expect(author.bodyReads + author.articleReads, 0);
++      expect(topic.bodyReads + topic.articleReads, 0);
++    }
++  });
++
++  test('toggling the service takes effect on the same card immediately',
++      () async {
++    await service.addPersonalRule(_rule);
++    final data = _ObservedBody();
++    expect(ContentFilterProjection.match(data), isNull);
++    expect(data.bodyReads, 0);
++
++    await service.setEnabled(true);
++    expect(ContentFilterProjection.match(data)?.ruleId, _rule.id);
++    expect(data.bodyReads, greaterThan(0));
++    expect(data.articleReads, greaterThan(0));
++    final reads = (data.bodyReads, data.articleReads);
++
++    final saving = service.setEnabled(false);
++    expect(ContentFilterProjection.match(data), isNull);
++    expect((data.bodyReads, data.articleReads), reads);
++    await saving;
++
++    await service.setEnabled(true);
++    expect(ContentFilterProjection.match(data)?.ruleId, _rule.id);
++  });
++
++  test('enabled cards use current rules, exceptions and edited content',
++      () async {
++    await service.setEnabled(true);
++    final data = _ObservedBody();
++    expect(ContentFilterProjection.match(data), isNull);
++    await service.addPersonalRule(_rule);
++    expect(ContentFilterProjection.match(data)?.ruleId, _rule.id);
++
++    final disabling = service.setRuleDisabled(_rule.id, true);
++    expect(ContentFilterProjection.match(data), isNull);
++    await disabling;
++    await service.setRuleDisabled(_rule.id, false);
++    expect(ContentFilterProjection.match(data)?.ruleId, _rule.id);
++
++    final allowing = service.setContentAllowed('feed:42', true);
++    expect(ContentFilterProjection.match(data), isNull);
++    await allowing;
++    await service.setContentAllowed('feed:42', false);
++    expect(ContentFilterProjection.match(data)?.ruleId, _rule.id);
++
++    data.message = '<p>Ordinary edited content</p>';
++    expect(ContentFilterProjection.match(data), isNull);
++  });
++}
+diff --git a/apps/flutter/test/utils/markdown_fast_path_test.dart b/apps/flutter/test/utils/markdown_fast_path_test.dart
+new file mode 100644
+--- /dev/null
++++ b/apps/flutter/test/utils/markdown_fast_path_test.dart
+@@ -0,0 +1,109 @@
++import 'package:c001apk_flutter/utils/markdown_content.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:html/parser.dart' as html;
++
++void main() {
++  test('plain multilingual posts keep their original fallback representation',
++      () {
++    for (final source in [
++      '',
++      '今天的续航不错，手机没有发热。',
++      'iPhone 16 Pro Max 今天拍了照片 📸',
++      '第一行\n第二行\n\n第三行',
++      '   三个空格不构成代码\n下一行',
++      '价格：999 元；电量 80%！',
++      'Café naïve 中文 العربية 한국어 🙂',
++    ]) {
++      for (final coolapk in [false, true]) {
++        for (final showEmoji in [false, true]) {
++          for (final forExport in [false, true]) {
++            final result = MarkdownContent.parse(source,
++                coolapk: coolapk, showEmoji: showEmoji, forExport: forExport);
++            expect(result.isMarkdown, isFalse, reason: source);
++            expect(result.source, source);
++            expect(result.preview, source);
++            expect(result.html, isEmpty);
++            expect(result.imageUrls, isEmpty);
++          }
++        }
++      }
++    }
++  });
++
++  test('explicit plain documents still render through Markdown', () {
++    const source = '更新说明\n下一行';
++    for (final coolapk in [false, true]) {
++      final result =
++          MarkdownContent.parse(source, explicit: true, coolapk: coolapk);
++      expect(result.isMarkdown, isTrue);
++      expect(result.html, contains('<p>'));
++      expect(html.parseFragment(result.html).text, contains('更新说明'));
++    }
++    expect(MarkdownContent.parse(source).isMarkdown, isFalse);
++  });
++
++  test('block and inline detection boundaries retain full Markdown rendering',
++      () {
++    final cases = <String, String>{
++      '# 标题': 'h1',
++      '标题\n===': 'h1',
++      '标题\n---': 'h2',
++      '- 第一项\n- 第二项': 'ul',
++      '+ 第一项\n+ 第二项': 'ul',
++      '* 第一项\n* 第二项': 'ul',
++      '1. 第一项\n2. 第二项': 'ol',
++      '1) 第一项\n2) 第二项': 'ol',
++      '正文\n\n    代码': 'pre',
++      '\t代码': 'pre',
++      '```text\n代码\n```': 'pre',
++      '~~~text\n代码\n~~~': 'pre',
++      '> 引用': 'blockquote',
++      '**重点**': 'strong',
++      '_强调_': 'em',
++      '~~删除~~': 'del',
++      '`代码`': 'code',
++      '[链接](https://example.com)': 'a',
++      '![图片](https://example.com/image.png)': 'img',
++      '| 标题 |\n| --- |\n| 内容 |': 'table',
++    };
++    for (final entry in cases.entries) {
++      final result = MarkdownContent.parse(entry.key);
++      expect(result.isMarkdown, isTrue, reason: entry.key);
++      expect(
++          html.parseFragment(result.html).querySelector(entry.value), isNotNull,
++          reason: entry.key);
++    }
++  });
++
++  test('normalization cannot hide encoded or HTML separated syntax', () {
++    for (final source in [
++      '&#35;&#35; 标题',
++      '&#42;&#42;重点&#42;&#42;',
++      '&gt; 引用',
++      '第一行<br>## 标题',
++      '<p>第一行</p><p>## 标题</p>',
++      '## 标题\r\n正文',
++    ]) {
++      expect(MarkdownContent.parse(source).isMarkdown, isTrue, reason: source);
++    }
++  });
++
++  test('native links, emoji and escaped punctuation retain legacy fallback',
++      () {
++    for (final source in [
++      '<a class="feed-link-tag" href="/t/test">#test#</a> 今天更新',
++      '<a class="feed-link-url" href="coolmarket://feed/123">动态</a>',
++      '[哈哈哈] 今天拍了照片',
++      r'\*普通文本\*',
++      '1. 单项',
++      '#话题# 普通内容',
++      'https://example.com?a=1&b=2',
++      'POCO_X3_GT',
++    ]) {
++      final result = MarkdownContent.parse(source);
++      expect(result.isMarkdown, isFalse, reason: source);
++      expect(result.preview, source);
++      expect(result.source, source);
++    }
++  });
++}
