@@ -1,0 +1,209 @@
+name: Build unsigned iPhone IPA
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - customization.patch
+      - verify_ios_ipa.py
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-lite-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: '3.47.7'
+  BUILD_NAME: '1.5.2'
+  UPSTREAM_REVISION: c034b98a536423fb23b35feda39dc63bf8043bb8
+
+defaults:
+  run:
+    working-directory: source/apps/flutter
+    shell: bash
+
+jobs:
+  checks:
+    name: Offline analysis and tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      build_date: ${{ steps.version.outputs.date }}
+    steps:
+      - name: Checkout customization
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Checkout pinned public source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: TG-Twilight/c001apk
+          ref: c034b98a536423fb23b35feda39dc63bf8043bb8
+          path: source
+          persist-credentials: false
+      - name: Apply customization
+        working-directory: .
+        run: |
+          git -C source apply --check ../customization.patch
+          git -C source apply ../customization.patch
+          cp verify_ios_ipa.py source/apps/flutter/tool/verify_ios_ipa.py
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Resolve build date (UTC+8)
+        id: version
+        run: dart tool/update_build_date.dart
+      - run: flutter pub get --enforce-lockfile
+      - name: Analyze
+        run: flutter analyze --no-pub --no-fatal-infos
+      - name: Run original offline regression tests
+        run: flutter test --no-pub
+      - name: Install preview fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+      - name: Run customized edition tests
+        env:
+          UI_PREVIEW_FONT: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+        run: flutter test --no-pub --dart-define=C001APK_LITE=true --dart-define=EXPORT_UI_PREVIEWS=true test/lite
+      - name: Upload navigation previews
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ios-lite-navigation-previews
+          path: source/apps/flutter/build/ui-previews/*.png
+          if-no-files-found: error
+          retention-days: 14
+      - name: Check dependency lockfile
+        run: git diff --exit-code -- pubspec.lock
+
+  ios:
+    name: iPhone arm64 release (unsigned)
+    needs: checks
+    runs-on: xcode-27
+    timeout-minutes: 40
+    env:
+      BUILD_NUMBER: ${{ needs.checks.outputs.build_date }}.4
+    steps:
+      - name: Checkout customization
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Checkout pinned public source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: TG-Twilight/c001apk
+          ref: c034b98a536423fb23b35feda39dc63bf8043bb8
+          path: source
+          persist-credentials: false
+      - name: Apply customization
+        working-directory: .
+        run: |
+          git -C source apply --check ../customization.patch
+          git -C source apply ../customization.patch
+          cp verify_ios_ipa.py source/apps/flutter/tool/verify_ios_ipa.py
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Synchronize build date
+        run: dart tool/update_build_date.dart "${{ needs.checks.outputs.build_date }}"
+      - run: flutter pub get --enforce-lockfile
+      - name: Select an installed iOS 27 iPhone simulator
+        run: |
+          mkdir -p build
+          xcodebuild -version
+          xcrun simctl list devices available --json > build/simulators.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads(Path('build/simulators.json').read_text())
+          candidates = [(runtime, d) for runtime, devices in data['devices'].items()
+                        if '.iOS-27-' in runtime for d in devices
+                        if d.get('isAvailable') and d['name'].startswith('iPhone')]
+          if not candidates:
+              raise SystemExit('No installed iOS 27 iPhone simulator found')
+          candidates.sort(key=lambda item: (not item[0].endswith('iOS-27-0'),
+                                             item[1]['name'] != 'iPhone 16 Pro Max',
+                                             item[0], item[1]['name']))
+          runtime, device = candidates[0]
+          Path('build/ios27-simulator.json').write_text(json.dumps(
+              {'runtime': runtime, 'device': device}, indent=2))
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('SIM_ID=' + device['udid'] + '\n')
+          print(runtime, device['name'], device['udid'])
+          PY
+      - name: Run actual iOS 27 touch gestures on offline fixture
+        run: |
+          xcrun simctl boot "$SIM_ID"
+          xcrun simctl bootstatus "$SIM_ID" -b
+          flutter build ios --simulator --debug --target=tool/ios_gesture_smoke.dart --dart-define=C001APK_LITE=true
+          ruby tool/setup_ios_gesture_ui_tests.rb
+          trap 'ruby tool/setup_ios_gesture_ui_tests.rb --clean' EXIT
+          xcodebuild test -workspace ios/Runner.xcworkspace -scheme GestureSmoke \
+            -configuration Debug -destination "platform=iOS Simulator,id=$SIM_ID" \
+            -derivedDataPath build/ios-smoke-derived \
+            -resultBundlePath build/ios27-smoke.xcresult \
+            -parallel-testing-enabled NO -only-testing:GestureSmokeUITests \
+            CODE_SIGNING_ALLOWED=NO FLUTTER_TARGET=tool/ios_gesture_smoke.dart \
+            COMPILER_INDEX_STORE_ENABLE=NO | tee build/ios27-smoke.log
+          ruby tool/setup_ios_gesture_ui_tests.rb --clean
+          trap - EXIT
+      - name: Export simulator screenshots
+        if: always()
+        run: |
+          if [ -d build/ios27-smoke.xcresult ]; then
+            xcrun xcresulttool export attachments --path build/ios27-smoke.xcresult --output-path build/ios27-smoke-attachments
+          fi
+      - name: Upload iOS 27 simulation evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ios27-gesture-simulation
+          path: |
+            source/apps/flutter/build/ios27-smoke-attachments/**
+            source/apps/flutter/build/ios27-smoke.log
+            source/apps/flutter/build/ios27-simulator.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Build unsigned iPhone release
+        # Flutter regenerates release-mode plugin registration here. Dependencies
+        # were resolved with the lockfile enforced and must not change below.
+        run: |
+          flutter build ios --release --no-codesign --target=lib/main.dart --dart-define=C001APK_LITE=true --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER"
+          git diff --exit-code -- pubspec.lock
+      - name: Package and verify IPA
+        run: |
+          distribution="$PWD/build/distribution"
+          staging="$distribution/ios-staging"
+          mkdir -p "$staging/Payload"
+          ditto build/ios/iphoneos/Runner.app "$staging/Payload/Runner.app"
+          archive="c001apk-lite-$BUILD_NAME+$BUILD_NUMBER-ios-arm64-unsigned.ipa"
+          (cd "$staging" && ditto -c -k --keepParent Payload "../$archive")
+          python3 tool/verify_ios_ipa.py "$distribution/$archive" \
+            --expected-bundle-id com.randyliu2020.c001apk.lite \
+            --expected-version "$BUILD_NAME" \
+            --expected-build "$BUILD_NUMBER" \
+            --source-revision "$GITHUB_SHA" \
+            --upstream-revision "$UPSTREAM_REVISION" \
+            --flutter-version "$FLUTTER_VERSION" \
+            --xcode-version "$(xcodebuild -version | tr '\n' ' ')" \
+            --report "$distribution/provenance.json"
+          (cd "$distribution" && shasum -a 256 "$archive" > SHA256SUMS.txt)
+          echo 'Built and verified an unsigned iPhone arm64 IPA from the public source implementation. Sign the complete app with your own certificate and provisioning profile before installing. Physical iPhone login and runtime acceptance have not been performed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload IPA and verification results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: c001apk-lite-ios-arm64-unsigned
+          path: |
+            source/apps/flutter/build/distribution/*-ios-arm64-unsigned.ipa
+            source/apps/flutter/build/distribution/SHA256SUMS.txt
+            source/apps/flutter/build/distribution/provenance.json
+          if-no-files-found: error
+          retention-days: 14
