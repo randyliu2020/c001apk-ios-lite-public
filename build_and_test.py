@@ -17,6 +17,7 @@ OUT.mkdir(exist_ok=True)
 
 
 def run(*args, timeout=180):
+    print('Running: ' + ' '.join(str(x) for x in args), flush=True)
     result = subprocess.run([str(x) for x in args], cwd=ROOT, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             timeout=timeout)
@@ -55,6 +56,16 @@ run(clang, '-target', f'{architecture}-apple-ios17.0-simulator',
     'CFBundleVersion': '1', 'CFBundleShortVersionString': '1.0',
     'MinimumOSVersion': '17.0', 'LSRequiresIPhoneOS': True,
     'UIDeviceFamily': [1, 2], 'UILaunchScreen': {},
+    'UIApplicationSceneManifest': {
+        'UIApplicationSupportsMultipleScenes': False,
+        'UISceneConfigurations': {
+            'UIWindowSceneSessionRoleApplication': [{
+                'UISceneClassName': 'UIWindowScene',
+                'UISceneConfigurationName': 'Default Configuration',
+                'UISceneDelegateClassName': 'DisplayTestSceneDelegate',
+            }]
+        },
+    },
 }))
 run('codesign', '--force', '--sign', '-', app)
 devices = json.loads(run('xcrun', 'simctl', 'list', 'devices', 'available', '--json'))
