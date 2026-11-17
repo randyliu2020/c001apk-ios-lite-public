@@ -1,0 +1,55 @@
+Original UI close actions: implementation rationale and evidence limits
+
+Scope
+CoolapkDisplay's close strategy calls the official Skip/Close action after the
+official lifecycle method. It does not change advertisement data, validity checks,
+SDK callback methods, networking, identity, pagination, media or gestures.
+
+This is an early UI close. It can cause the application's normal close callbacks
+and cleanup to happen earlier. It would be inaccurate to claim that SDK behavior
+or all callback timing is unchanged. The plugin does not fabricate impressions,
+load success, render success or an SDK close event directly.
+
+Splash
+- Exact controller: _TtC10CoolMarket33SplashAdvertisementViewController.
+- Metadata gives viewDidAppear: as v20@0:8B16 and didTapSkipButton as v16@0:8.
+- didTapSkipButton at main-file offset 0x5300c4 enters the official hide(animated:)
+  routine at 0x532cf0.
+- Disassembly shows a hideCalled guard, timer invalidation/release, and main-queue
+  dispatch to an existing application closure. Its thunk 0x5330fc enters 0x52fe34.
+- The plugin uses the runtime-validated original method IMP, never these raw
+  offsets or a guessed Swift object layout.
+
+Interstitial
+- Exact view: _TtC10CoolMarket20KAInterstitialAdView (UIView descendant).
+- didTapClose has ABI v16@0:8; didMoveToWindow is inherited from the UIView chain.
+- Official action 0x3bf768 enters 0x3bfa10 and creates its own 0.25-second UIKit
+  animation/completion. The original completion thunk 0x3c0628 enters ObjC stub
+  0x102b10020. Any official didCloseBlock remains part of the existing action path.
+- The plugin does not manually remove the modal or invoke didCloseBlock. The
+  application keeps responsibility for its close animation and cleanup.
+
+Safety of dispatch
+- Every lifecycle and action signature is checked before changing the class.
+- Inherited methods are overridden on the target class; parents are not edited.
+- Original lifecycle receives the original arguments before any queued action.
+- Main-queue tasks hold receiver, surface and window weakly and recheck identity
+  and attachment before acting. No timer polls for the view.
+- Manual and queued action share an invocation guard. Interstitial detachment
+  invalidates old tickets and resets the next attachment's state. The splash
+  controller guard is once per controller instance.
+- Controllers already dismissing, moving away, or presenting another controller
+  are not automatically skipped at that moment.
+- Entire BUSplashView/BUSplashCardView/interstitial containers are not hidden by
+  the visibility installer, preserving their fallback controls and closing path.
+
+What still requires a real-device check
+Simulator fixtures test dispatch correctness, lifetime, queue cancellation and
+isolation. They do not prove that all real SDK providers share the same lifecycle,
+that every advertisement is covered, or that modified-client restrictions will
+not occur. An unrecognized class or incompatible action is left untouched.
+
+Primary local evidence
+../official-ad-objc-metadata.json
+../splash-close-disassembly.txt
+../splash-completion-disassembly.txt

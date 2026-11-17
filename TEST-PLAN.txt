@@ -1,0 +1,143 @@
+CoolapkDisplay 16.7: scope and native test contract
+
+Build
+- Objective-C with -fobjc-arc -fblocks, Foundation/UIKit; no Substrate dependency.
+- Device deployment target iOS 17.0, architecture arm64, standard system frameworks only.
+- Native test build additionally defines CD_TESTING=1. This suppresses the constructor
+  and exports:
+    bool CDInstallViewClassForTesting(Class target);
+    bool CDInstallCloseViewClassForTesting(Class target);
+    bool CDInstallCloseControllerClassForTesting(Class target);
+    void CDInstallKnownTargetsForTesting(void);
+- Invoke test entrypoints and UIKit methods on the main thread.
+- Installer returns true for installed/already-installed classes and false for an
+  invalid class, incompatible ABI, off-main-thread invocation, or installation failure.
+- Test entrypoints do not exist in the production dylib.
+
+Exact production targets: visibility only
+1. _TtC10CoolMarket44GeneralEntityListFeedAdvertisementCellBaseV4
+2. _TtCC10CoolMarket44GeneralEntityListFeedAdvertisementCellBaseV48BodyView
+3. _TtC10CoolMarket59GeneralEntityListFeedAdvertisementCellBaseV4_ImageMediaView
+4. _TtCC10CoolMarket44GeneralEntityListFeedAdvertisementCellBaseV423SelfRenderContainerView
+
+Each target must be a proper UIView subclass at runtime. UIView itself, non-view
+classes, missing classes and incompatible method signatures are skipped. The
+old plugin's BUSplashAdView name is deliberately not used. The actual UIKit
+inheritance chains were statically checked by the main-binary audit agent.
+
+Exact production targets: original UI close action
+5. _TtC10CoolMarket33SplashAdvertisementViewController
+   Original viewDidAppear:(BOOL) first, then queue original didTapSkipButton.
+6. _TtC10CoolMarket20KAInterstitialAdView
+   Original didMoveToWindow first, then queue original didTapClose.
+Neither entire container nor BUSplashView/BUSplashCardView is forcibly hidden.
+This keeps their original UI closing/cleanup path in control of the modal surface.
+The close installers require the exact action ABI void(id, SEL) before making any
+mutation. UIViewController itself, noncontrollers, nonviews and missing/wrong-type
+actions are rejected.
+
+What changes
+- Visibility targets: only layoutSubviews, didMoveToWindow and setHidden:.
+- Original implementation runs first. setHidden: receives its original BOOL.
+- Then only UIView.hidden is forced to YES, using cached UIView-level implementations
+  without sending messages back through our replacement.
+- Hooks are local to each target class, even for inherited implementations.
+- Each class/selector is installed at most once; repeated installation is a no-op.
+- Close-target lifecycle methods also run their originals first. The original
+  close action executes asynchronously on the main queue only while the same view
+  remains attached to the same surviving window. Captures of views/controllers
+  and windows are weak. No new timer or global scan is installed.
+- Original button actions and the scheduled automatic action share an invocation
+  guard. The action's original implementation, including cleanup, is retained.
+- Interstitial guards reset on window detachment/change. Old tickets cannot close
+  a reused view on its next attachment. Controller guards are once per instance;
+  an already-skipped controller is not automatically skipped again if reused.
+- Controllers being dismissed/removed or presenting another controller are left
+  alone. The installer does not force-load a controller view.
+
+What is preserved
+- List model, item counts, pagination cursors and item heights/layout attributes.
+- SDK ad data, markup, slots and validity/type implementations are not replaced.
+- SDK callback implementations are not hooked or directly invoked by the plugin.
+  The app's original UI close path can naturally emit its usual close callbacks
+  earlier. Callback timing and advertisement lifetime are therefore NOT unchanged.
+- Network, cookies, identifiers, authentication and account behavior.
+- Media URLs, image decoding/quality, gesture recognizers and navigation.
+- Original layout/window/setHidden implementation side effects.
+- There is no global UIView hook, view traversal, recurring timer or fabricated
+  impression/success callback.
+
+Required native simulator regression checks
+1. Local override: a fake ad view overrides all three methods and increments
+   counters. After installation, each original runs exactly once per explicit
+   invocation. Setting hidden=NO calls its original setter with NO but ends hidden.
+2. Inherited override: hook a fake ad subclass inheriting all three methods from a
+   shared fake base. Verify the base IMPs are bit-identical, the ordinary sibling
+   stays visible, and only the target acquires local replacements.
+3. Target parent and child: install parent then child, and separately child then
+   parent. Calling the child must not recurse; expected original counters must be
+   preserved. Both end hidden.
+4. De-duplication: install the same class repeatedly, compare all three IMPs before
+   and after retries, and verify counter changes have not multiplied.
+5. Invalid targets: Nil, NSObject, UIView and a runtime-created UIView subclass
+   with an incompatible method type must return false. Capture IMPs before and
+   after to prove no partial hook installed for an ABI rejection.
+6. Off-main-thread installer rejects safely; the main-thread retry still works.
+7. Reuse/resurface: show, layout, remove/add to a UIWindow, setHidden:NO, and call
+   prepareForReuse on a fake ad UICollectionViewCell. It stays hidden after the
+   hooked lifecycle calls; original prepareForReuse and layout/model are unchanged.
+8. Frame/bounds/constraints: record these and original counters. Hiding must not
+   change sizes, remove the cell, or change list item counts.
+9. Ordinary content: an unlisted UIView/UIImageView/UICollectionViewCell and a fake
+   view with an ad-like but non-exact name remain untouched by known-target install.
+10. Exact-name fixture: runtime-create one listed class as a UIView subclass, call
+    CDInstallKnownTargetsForTesting twice, and verify its visibility/IMP stability.
+11. Gestures and image object: attach recognizers and an image view to a normal
+    sibling; verify recognizer identities, delegates, enabled flags and image object
+    remain unchanged before/after known-target install and ad lifecycle calls.
+12. Compile production without CD_TESTING and inspect Mach-O: no private loader
+    paths, no Substrate load, no exported CD*ForTesting symbols.
+13. Close action ABI: missing/wrong-return/wrong-argument action rejects the whole
+    class, leaving lifecycle and action IMPs unchanged. Parent methods stay intact.
+14. Original interstitial lifecycle runs first. A window-attached fixture closes
+    once on the main queue, through its original action, without being hidden.
+15. Manual close before the queued task runs must not call the original twice.
+    Repeated lifecycle callbacks during the same attachment do not duplicate it.
+16. Detach before draining the queue: no close. Reattach the same view to the same
+    or another window: a new epoch closes once; the old queued epoch is ignored.
+17. Releasing the fixture before the queued task executes must not extend its
+    lifetime or crash. A surviving controller whose window disappeared can later
+    receive another real appearance and schedule again (stale ticket is cleared).
+18. Splash fixture preserves its original viewDidAppear: BOOL argument and closes
+    once via original didTapSkipButton. No loaded view/window means no close and
+    no implicit loadView. Already-dismissed/child-presenting fixtures are skipped.
+19. Parent/child close targets installed in either order: original actions are
+    called once, without recursion. No unrelated sibling's dispatch changes.
+
+Practical limits / device acceptance
+- Hiding an advertisement cell intentionally leaves its original layout space.
+- Splash/interstitial use their original Skip/Close handlers; no synthetic SDK
+  success/exposure/close callback is invoked by this plugin. Real device checks
+  still must verify modal dismissal and timing for each supported ad provider.
+- Hiding a view can naturally affect the SDK's visibility observation. The plugin
+  never fabricates an exposure, but cannot guarantee a server will accept modified
+  clients or that a previous account restriction is cleared.
+- Existing displayed views receive the change on their next layout/window/visibility
+  callback. There is no initial whole-tree scan and no repeated installation timer.
+- Simulator fake-class tests establish dispatch/isolation/ABI behavior. They do not
+  establish coverage of every real advertisement or real SDK behavior.
+- UIView-level getter/setter IMPs are captured at installation. If a different
+  retained plugin previously changed those global methods, they are not guaranteed
+  to be Apple's original implementations. This plugin does not itself modify them.
+
+Static close-path evidence (all offsets in the supplied main executable)
+- Splash didTapSkipButton 0x5300c4 enters hide(animated:) at 0x532cf0. That path
+  checks/sets hideCalled, invalidates/releases its timer and dispatches its existing
+  completion on the main queue. Closure 0x5330fc enters 0x52fe34. No SDK method is
+  replaced by the plugin; the official action remains responsible for cleanup.
+- Interstitial didTapClose 0x3bf768 enters 0x3bfa10, which schedules its original
+  0.25-second UIKit animation/completion. The completion at 0x3c0628 invokes the
+  original removal path; the app's original didCloseBlock behavior is retained.
+- Evidence files: ../splash-close-disassembly.txt and
+  ../splash-completion-disassembly.txt; further closure annotations are supplied
+  by the main-binary analysis agent.
