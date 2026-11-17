@@ -85,10 +85,13 @@ jobs:
   ios:
     name: iPhone arm64 release (unsigned)
     needs: checks
+    outputs:
+      artifact_id: ${{ steps.ipa_artifact.outputs.artifact-id }}
+      artifact_digest: ${{ steps.ipa_artifact.outputs.artifact-digest }}
     runs-on: xcode-27
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
-      BUILD_NUMBER: ${{ needs.checks.outputs.build_date }}.5
+      BUILD_NUMBER: ${{ needs.checks.outputs.build_date }}.6
     steps:
       - name: Checkout customization
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -139,11 +142,13 @@ jobs:
               output.write('SIM_ID=' + device['udid'] + '\n')
           print(runtime, device['name'], device['udid'])
           PY
-      - name: Run actual iOS 27 touch gestures on offline fixture
+      - name: Build iOS 27 simulator gesture fixture
         run: |
           xcrun simctl boot "$SIM_ID"
           xcrun simctl bootstatus "$SIM_ID" -b
           flutter build ios --simulator --debug --target=tool/ios_gesture_smoke.dart --dart-define=C001APK_LITE=true
+      - name: Run actual iOS 27 touch gestures on offline fixture
+        run: |
           ruby tool/setup_ios_gesture_ui_tests.rb
           trap 'ruby tool/setup_ios_gesture_ui_tests.rb --clean' EXIT
           xcodebuild test -workspace ios/Runner.xcworkspace -scheme GestureSmoke \
@@ -198,6 +203,7 @@ jobs:
           (cd "$distribution" && shasum -a 256 "$archive" > SHA256SUMS.txt)
           echo 'Built and verified an unsigned iPhone arm64 IPA from the public source implementation. Sign the complete app with your own certificate and provisioning profile before installing. Physical iPhone login and runtime acceptance have not been performed.' >> "$GITHUB_STEP_SUMMARY"
       - name: Upload IPA and verification results
+        id: ipa_artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: c001apk-lite-ios-arm64-unsigned
@@ -205,5 +211,229 @@ jobs:
             source/apps/flutter/build/distribution/*-ios-arm64-unsigned.ipa
             source/apps/flutter/build/distribution/SHA256SUMS.txt
             source/apps/flutter/build/distribution/provenance.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish verified IPA for direct download
+    needs: [checks, ios]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    defaults:
+      run:
+        working-directory: .
+        shell: bash
+    outputs:
+      download_url: ${{ steps.release.outputs.download_url }}
+      release_url: ${{ steps.release.outputs.release_url }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_NUMBER: ${{ needs.checks.outputs.build_date }}.6
+      ARTIFACT_ID: ${{ needs.ios.outputs.artifact_id }}
+      ARTIFACT_DIGEST: ${{ needs.ios.outputs.artifact_digest }}
+    steps:
+      - name: Download and verify this run's release artifact
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID" > artifact-info.json
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID/zip" > artifact.zip
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import plistlib
+          import re
+          import zipfile
+          
+          artifact = json.loads(Path('artifact-info.json').read_text())
+          artifact_id = int(os.environ['ARTIFACT_ID'])
+          digest = os.environ['ARTIFACT_DIGEST'].removeprefix('sha256:')
+          assert re.fullmatch(r'[0-9a-f]{64}', digest)
+          assert artifact['id'] == artifact_id
+          assert artifact['name'] == 'c001apk-lite-ios-arm64-unsigned'
+          assert not artifact['expired']
+          assert artifact['workflow_run']['id'] == int(os.environ['GITHUB_RUN_ID'])
+          assert artifact['workflow_run']['head_sha'] == os.environ['GITHUB_SHA']
+          assert artifact['digest'] == 'sha256:' + digest
+          assert hashlib.sha256(Path('artifact.zip').read_bytes()).hexdigest() == digest
+          
+          build = os.environ['BUILD_NUMBER']
+          assert re.fullmatch(r'\d{8}\.6', build)
+          name = f"c001apk-lite-{os.environ['BUILD_NAME']}+{build}-ios-arm64-unsigned.ipa"
+          expected = {name, 'SHA256SUMS.txt', 'provenance.json'}
+          with zipfile.ZipFile('artifact.zip') as archive:
+              assert archive.testzip() is None
+              assert set(archive.namelist()) == expected
+              assert len(archive.namelist()) == len(expected)
+              for member in expected:
+                  Path(member).write_bytes(archive.read(member))
+          report = json.loads(Path('provenance.json').read_text())
+          ipa_digest = hashlib.sha256(Path(name).read_bytes()).hexdigest()
+          assert report['archive'] == name
+          assert report['sha256'] == ipa_digest
+          assert report['archive_bytes'] == Path(name).stat().st_size
+          assert report['source_revision'] == os.environ['GITHUB_SHA']
+          assert report['upstream_revision'] == os.environ['UPSTREAM_REVISION']
+          assert report['version'] == os.environ['BUILD_NAME']
+          assert report['build_number'] == build
+          assert report['bundle_identifier'] == 'com.randyliu2020.c001apk.lite'
+          assert report['platform'] == 'iPhoneOS'
+          assert report['architectures'] == ['arm64']
+          assert report['requires_user_signing'] is True
+          assert report['embedded_provisioning_profile'] is False
+          assert report['zip_crc_verified'] is True
+          assert len(report['binaries']) == 19
+          sums = Path('SHA256SUMS.txt').read_text().split()
+          assert sums == [ipa_digest, name]
+          with zipfile.ZipFile(name) as archive:
+              assert archive.testzip() is None
+              assert not any('.xctest/' in p or 'GestureSmoke' in p or p.endswith('/kernel_blob.bin')
+                             for p in archive.namelist())
+              info = plistlib.loads(archive.read('Payload/Runner.app/Info.plist'))
+              assert info['CFBundleVersion'] == build
+              assert info['CFBundleShortVersionString'] == os.environ['BUILD_NAME']
+              assert info['CFBundleIdentifier'] == report['bundle_identifier']
+              assert info.get('CADisableMinimumFrameDurationOnPhone') is True
+              scenes = info['UIApplicationSceneManifest']['UISceneConfigurations']['UIWindowSceneSessionRoleApplication']
+              assert any(s.get('UISceneDelegateClassName') == 'FlutterSceneDelegate' for s in scenes)
+              for path, binary in report['binaries'].items():
+                  assert hashlib.sha256(archive.read(path)).hexdigest() == binary['sha256']
+                  assert binary['slices'] and all(
+                      p['architecture'] == 'arm64' and p['platform'] == 'iPhoneOS'
+                      for p in binary['slices'])
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'IPA_NAME={name}\n')
+              env.write(f'RELEASE_TAG=ios-lite-r6-{build}\n')
+          print('Verified r6 IPA from this run:', name, ipa_digest)
+          
+          PY
+      - name: Publish verified release without replacing existing assets
+        id: release
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          from urllib.parse import quote
+          
+          repo = os.environ['GH_REPO']
+          commit = os.environ['GITHUB_SHA']
+          tag = os.environ['RELEASE_TAG']
+          ipa_name = os.environ['IPA_NAME']
+          names = [ipa_name, 'SHA256SUMS.txt', 'provenance.json']
+          expected = {
+              name: {'size': Path(name).stat().st_size,
+                     'digest': 'sha256:' + hashlib.sha256(Path(name).read_bytes()).hexdigest()}
+              for name in names
+          }
+          
+          def gh(*args):
+              return subprocess.check_output(['gh', *args], text=True)
+          
+          def api(path):
+              return json.loads(gh('api', path))
+          
+          # A pre-existing tag must resolve to this exact source commit.
+          reference = subprocess.run(
+              ['gh', 'api', f'repos/{repo}/git/ref/tags/{quote(tag, safe="")}'],
+              capture_output=True, text=True)
+          if reference.returncode == 0:
+              obj = json.loads(reference.stdout)['object']
+              for _ in range(5):
+                  if obj['type'] != 'tag':
+                      break
+                  obj = api(f'repos/{repo}/git/tags/{obj["sha"]}')['object']
+              assert obj['type'] == 'commit' and obj['sha'] == commit, 'Tag points elsewhere'
+          else:
+              assert 'HTTP 404' in reference.stderr, reference.stderr
+          
+          # Listing also includes drafts for this token. Never treat an API failure as absence.
+          pages = json.loads(gh('api', f'repos/{repo}/releases', '--paginate', '--slurp'))
+          matches = [r for page in pages for r in page if r['tag_name'] == tag]
+          assert len(matches) <= 1, 'Duplicate release tags'
+          if matches:
+              release = api(f'repos/{repo}/releases/{matches[0]["id"]}')
+          else:
+              notes = f"""c001apk iOS 精简版 r6（{os.environ['BUILD_NAME']} / {os.environ['BUILD_NUMBER']}）
+          
+          下载下方 .ipa 文件，在全能签中使用自己的有效证书签名安装。
+          普通评论和用户名采用保守的轻量文字显示；复杂格式继续沿用原有渲染流程。
+          保留链接、表情、图片清晰度及原有返回、缩放和切图手势。
+          代码检查、回归和 iOS 27 模拟器触摸测试已完成，详细结果见本次构建记录。
+          真机流畅度仍需要安装后的同场景记录验证，不承诺固定 120 帧。
+          
+          构建记录：https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}
+          源码与复现：https://github.com/{repo}/tree/{commit}
+          基于 TG-Twilight/c001apk 公开实现，源码与修改遵循 AGPLv3。
+          IPA SHA256：{expected[ipa_name]['digest'].removeprefix('sha256:')}
+          """
+              Path('release-notes.txt').write_text(notes, encoding='utf-8')
+              gh('release', 'create', tag, '--target', commit, '--draft',
+                 '--title', f"c001apk iOS 精简版 r6 · {os.environ['BUILD_NUMBER']}",
+                 '--notes-file', 'release-notes.txt')
+              release_id = gh('release', 'view', tag, '--json', 'databaseId', '--jq', '.databaseId').strip()
+              release = api(f'repos/{repo}/releases/{release_id}')
+          
+          def validate_existing(release, complete=False):
+              assert release['tag_name'] == tag
+              assert release['target_commitish'] == commit, 'Release source differs'
+              assets = {a['name']: a for a in release['assets']}
+              assert len(assets) == len(release['assets']), 'Duplicate asset names'
+              assert set(assets) <= set(expected), 'Unexpected release assets'
+              if complete or not release['draft']:
+                  assert set(assets) == set(expected), 'Published release is incomplete'
+              for name, asset in assets.items():
+                  assert asset['state'] == 'uploaded', f'Incomplete asset: {name}'
+                  assert asset['size'] == expected[name]['size'], f'Asset size differs: {name}'
+                  assert asset['digest'] == expected[name]['digest'], f'Asset hash differs: {name}'
+              return assets
+          
+          assets = validate_existing(release)
+          missing = [name for name in names if name not in assets]
+          if missing:
+              assert release['draft'], 'Refusing to change an existing public release'
+              # Upload only missing assets. No --clobber and no deletion of existing files.
+              gh('release', 'upload', tag, *missing)
+          release = api(f'repos/{repo}/releases/{release["id"]}')
+          validate_existing(release, complete=True)
+          if release['draft']:
+              gh('release', 'edit', tag, '--draft=false')
+          release = api(f'repos/{repo}/releases/{release["id"]}')
+          assets = validate_existing(release, complete=True)
+          assert release['draft'] is False
+          direct_url = assets[ipa_name]['browser_download_url']
+          receipt = {
+              'release_url': release['html_url'], 'download_url': direct_url,
+              'release_id': release['id'], 'release_tag': tag,
+              'asset_id': assets[ipa_name]['id'], 'bytes': expected[ipa_name]['size'],
+              'sha256': expected[ipa_name]['digest'].removeprefix('sha256:'),
+              'source_revision': commit, 'build_number': os.environ['BUILD_NUMBER'],
+              'run_id': int(os.environ['GITHUB_RUN_ID']),
+              'artifact_id': int(os.environ['ARTIFACT_ID']),
+              'artifact_digest': os.environ['ARTIFACT_DIGEST'],
+              'draft': release['draft'],
+          }
+          Path('release-status.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('download_url=' + direct_url + '\n')
+              output.write('release_url=' + release['html_url'] + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'\n[Download the verified r6 IPA]({direct_url})\n')
+          print(json.dumps(receipt, indent=2))
+          
+          PY
+      - name: Upload public download receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ios-lite-public-download
+          path: release-status.json
           if-no-files-found: error
           retention-days: 14

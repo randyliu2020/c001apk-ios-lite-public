@@ -5633,10 +5633,10 @@ index 0000000..c8a72a4
 +}
 diff --git a/apps/flutter/tool/ios_gesture_smoke.dart b/apps/flutter/tool/ios_gesture_smoke.dart
 new file mode 100644
-index 0000000..38eb72a
+index 0000000..dcc03da
 --- /dev/null
 +++ b/apps/flutter/tool/ios_gesture_smoke.dart
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,302 @@
 +// Simulator-only fixture. Production IPA builds must target lib/main.dart.
 +// No account, storage initialization or network request is performed here.
 +import 'dart:async';
@@ -5648,6 +5648,7 @@ index 0000000..38eb72a
 +import 'package:photo_view/photo_view.dart';
 +import 'package:photo_view/photo_view_gallery.dart';
 +
++import 'package:c001apk_flutter/components/html_text.dart';
 +import '../lib/components/liquid_navigation_bar.dart';
 +import '../lib/pages/others/imageview_page.dart';
 +import '../lib/router/app_pages.dart';
@@ -5909,8 +5910,10 @@ index 0000000..38eb72a
 +  Widget build(BuildContext context) => Scaffold(
 +        appBar: AppBar(title: const Text('Smoke post')),
 +        body: ListView(children: [
-+          const SizedBox(
-+              height: 120, child: Center(child: Text('Body drag region'))),
++          // Exercise the production plain-comment renderer under native drags.
++          // These unformatted fixture strings need neither storage nor network.
++          SizedBox(
++              height: 120, child: Center(child: htmlText('Body drag region'))),
 +          Semantics(
 +            identifier: 'smoke-gallery',
 +            container: true,
@@ -5931,7 +5934,7 @@ index 0000000..38eb72a
 +          for (var i = 0; i < 25; i++)
 +            SizedBox(
 +              height: 90,
-+              child: Center(child: Text('Body row $i')),
++              child: Center(child: htmlText('Body row $i')),
 +            ),
 +        ]),
 +      );
@@ -6514,5 +6517,668 @@ new file mode 100644
 +      expect(result.preview, source);
 +      expect(result.source, source);
 +    }
++  });
++}
+diff --git a/apps/flutter/lib/components/html_text.dart b/apps/flutter/lib/components/html_text.dart
+index 188a55c..b54f96e 100644
+--- a/apps/flutter/lib/components/html_text.dart
++++ b/apps/flutter/lib/components/html_text.dart
+@@ -10,6 +10,18 @@ import '../utils/utils.dart';
+ import '../logic/media/feed_media.dart';
+ import 'imageview.dart';
+ 
++// Only bypass HTML for text whose parsing cannot change its representation.
++// Brackets retain the existing emoji/badge handling; whitespace and markup
++// retain HTML's entity decoding, collapsing and line-break semantics.
++final _htmlTextNeedsParser = RegExp(r'[<>&\[\]\x00-\x1f\x7f]|  ');
++
++bool _isUnformattedHtmlText(String source) =>
++    source.isNotEmpty &&
++    // Longer documents retain the HTML renderer's automatic async path.
++    source.length <= 10000 &&
++    source.trim() == source &&
++    !_htmlTextNeedsParser.hasMatch(source);
++
+ Widget htmlText(
+   String html, {
+   double fontSize = 15,
+@@ -23,6 +35,10 @@ Widget htmlText(
+   Function? onShowTotalReply,
+   Function? onViewFan,
+ }) {
++  if (_isUnformattedHtmlText(html)) {
++    return _PlainHtmlText(html,
++        fontSize: fontSize, lineHeight: lineHeight, isBold: isBold);
++  }
+   String? htmlConvert;
+   if (GStorage.showEmoji) {
+     RegExp regExp = RegExp('\\[[^\\]]+\\]');
+@@ -148,3 +164,46 @@ Widget htmlText(
+             },
+           ));
+ }
++
++/// The plain-text equivalent of the pinned HTML renderer's single RichText.
++/// Keep its inherited style, scaling and selection behavior without a DOM or
++/// a second text renderer changing line wrapping when a comment first appears.
++class _PlainHtmlText extends StatelessWidget {
++  const _PlainHtmlText(this.text,
++      {required this.fontSize, required this.lineHeight, required this.isBold});
++
++  final String text;
++  final double fontSize;
++  final double lineHeight;
++  final bool isBold;
++
++  @override
++  Widget build(BuildContext context) {
++    var style = DefaultTextStyle.of(context).style.merge(TextStyle(
++          fontSize: fontSize,
++          height: lineHeight,
++          fontWeight: isBold ? FontWeight.bold : FontWeight.normal,
++        ));
++    // flutter_widget_from_html_core 0.17.4 scales the style with this legacy
++    // factor before creating RichText. Match it even for nonlinear scalers.
++    // ignore: deprecated_member_use
++    final scale = MediaQuery.textScaleFactorOf(context);
++    if (scale != 1 && style.fontSize != null) {
++      style = style.copyWith(fontSize: style.fontSize! * scale);
++    }
++    final registrar = SelectionContainer.maybeOf(context);
++    Widget child = RichText(
++      text: TextSpan(text: text, style: style),
++      textDirection: Directionality.maybeOf(context) ?? TextDirection.ltr,
++      selectionRegistrar: registrar,
++      selectionColor: registrar == null
++          ? null
++          : DefaultSelectionStyle.of(context).selectionColor ??
++              DefaultSelectionStyle.defaultColor,
++    );
++    if (registrar != null) {
++      child = MouseRegion(cursor: SystemMouseCursors.text, child: child);
++    }
++    return child;
++  }
++}
+diff --git a/apps/flutter/test/ui/html_text_plain_test.dart b/apps/flutter/test/ui/html_text_plain_test.dart
+new file mode 100644
+--- /dev/null
++++ b/apps/flutter/test/ui/html_text_plain_test.dart
+@@ -0,0 +1,322 @@
++import 'dart:io';
++
++import 'package:c001apk_flutter/components/cards/feed_reply_card.dart';
++import 'package:c001apk_flutter/components/html_text.dart';
++import 'package:c001apk_flutter/logic/model/feed/datum.dart';
++import 'package:c001apk_flutter/utils/storage_util.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/rendering.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:flutter_widget_from_html_core/flutter_widget_from_html_core.dart';
++import 'package:get/get.dart';
++import 'package:hive/hive.dart';
++
++const _fastKey = ValueKey('plain-renderer');
++const _oldKey = ValueKey('html-renderer');
++
++Finder _paragraph(Key key) =>
++    find.descendant(of: find.byKey(key), matching: find.byType(RichText));
++
++List<TextStyle> _styles(InlineSpan span, [TextStyle? inherited]) {
++  if (span is! TextSpan) return [];
++  final style = (inherited ?? const TextStyle()).merge(span.style);
++  return [
++    if (span.text?.isNotEmpty == true) style,
++    for (final child in span.children ?? <InlineSpan>[])
++      ..._styles(child, style),
++  ];
++}
++
++Map<String, Object?> _styleShape(TextStyle style) => {
++      'fontSize': style.fontSize,
++      'fontFamily': style.fontFamily,
++      'fontFamilyFallback': style.fontFamilyFallback,
++      'fontWeight': style.fontWeight,
++      'fontStyle': style.fontStyle,
++      'height': style.height,
++      'color': style.color,
++      'letterSpacing': style.letterSpacing,
++      'wordSpacing': style.wordSpacing,
++      'decoration': style.decoration,
++      'decorationColor': style.decorationColor,
++      'locale': style.locale,
++    };
++
++void _expectSameParagraph(WidgetTester tester) {
++  final fast = tester.renderObject<RenderParagraph>(_paragraph(_fastKey));
++  final old = tester.renderObject<RenderParagraph>(_paragraph(_oldKey));
++  expect(fast.text.toPlainText(), old.text.toPlainText());
++  expect(
++      _styles(fast.text).map(_styleShape), _styles(old.text).map(_styleShape));
++  expect(fast.size.width, closeTo(old.size.width, .001));
++  expect(fast.size.height, closeTo(old.size.height, .001));
++  expect(fast.textAlign, old.textAlign);
++  expect(fast.textDirection, old.textDirection);
++  expect(fast.textHeightBehavior, old.textHeightBehavior);
++  expect(fast.textScaler, old.textScaler);
++  expect(fast.maxLines, old.maxLines);
++  expect(fast.softWrap, old.softWrap);
++  expect(fast.overflow, old.overflow);
++  expect(
++      find.descendant(
++          of: find.byKey(_fastKey), matching: find.byType(HtmlWidget)),
++      findsNothing);
++  expect(
++      find.descendant(
++          of: find.byKey(_oldKey), matching: find.byType(HtmlWidget)),
++      findsOneWidget);
++  expect(tester.takeException(), isNull);
++}
++
++class _NonlinearScaler extends TextScaler {
++  const _NonlinearScaler();
++  @override
++  double scale(double fontSize) =>
++      fontSize < 20 ? fontSize * 1.5 : fontSize * 1.2;
++  @override
++  double get textScaleFactor => 1.3;
++}
++
++void main() {
++  late Directory temp;
++  setUpAll(() async {
++    temp = await Directory.systemTemp.createTemp('plain-html-rendering-');
++    Hive.init(temp.path);
++    GStorage.settings = await Hive.openBox('settings');
++  });
++  setUp(() async {
++    await GStorage.settings.clear();
++    Get.testMode = true;
++  });
++  tearDown(() async => Get.reset());
++  tearDownAll(() async {
++    await Hive.close();
++    await temp.delete(recursive: true);
++  });
++
++  Future<void> compare(WidgetTester tester, String source,
++      {Brightness brightness = Brightness.light,
++      TextDirection direction = TextDirection.ltr,
++      TextScaler scaler = TextScaler.noScaling,
++      bool selection = false,
++      bool bold = false}) async {
++    const textStyle =
++        TextStyle(fontSize: 15, height: 1.5, fontWeight: FontWeight.normal);
++    final style = textStyle.copyWith(
++        fontWeight: bold ? FontWeight.bold : FontWeight.normal);
++    Widget pair = Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
++      SizedBox(
++          key: _fastKey, width: 250, child: htmlText(source, isBold: bold)),
++      SizedBox(
++          key: _oldKey,
++          width: 250,
++          child: HtmlWidget(source, textStyle: style)),
++    ]);
++    if (selection) pair = SelectionArea(child: pair);
++    await tester.pumpWidget(MaterialApp(
++      theme: ThemeData(brightness: brightness),
++      home: Scaffold(
++          body: MediaQuery(
++        data: MediaQueryData(textScaler: scaler),
++        child: Directionality(
++          textDirection: direction,
++          child: DefaultTextHeightBehavior(
++            textHeightBehavior:
++                const TextHeightBehavior(applyHeightToFirstAscent: false),
++            child: DefaultTextStyle.merge(
++              maxLines: 1,
++              overflow: TextOverflow.ellipsis,
++              style: const TextStyle(
++                  fontFamily: 'Ahem', letterSpacing: .25, wordSpacing: .5),
++              child: Align(alignment: Alignment.topLeft, child: pair),
++            ),
++          ),
++        ),
++      )),
++    ));
++    await tester.pumpAndSettle();
++    _expectSameParagraph(tester);
++  }
++
++  testWidgets(
++      'plain text matches old paragraph layout across languages and styles',
++      (tester) async {
++    for (final source in [
++      '用户名',
++      '普通评论第一次显示也不需要解析 HTML。' * 5,
++      'A long ordinary comment keeps each single space and wraps across lines. ' *
++              3 +
++          'End',
++      'iPhone 今天拍照 📸🙂 很清晰',
++      'العربية تجربة تعليق عادي باللغة العربية',
++    ]) {
++      for (final brightness in Brightness.values) {
++        for (final direction in TextDirection.values) {
++          for (final scaler in [
++            TextScaler.noScaling,
++            const TextScaler.linear(1.7)
++          ]) {
++            await compare(tester, source,
++                brightness: brightness,
++                direction: direction,
++                scaler: scaler,
++                bold: brightness == Brightness.dark);
++          }
++        }
++      }
++    }
++  });
++
++  testWidgets('nonlinear scaling preserves the pinned renderer behavior',
++      (tester) async {
++    await compare(tester, '字号缩放后的普通评论 ' * 8 + '结束',
++        scaler: const _NonlinearScaler());
++  });
++
++  testWidgets(
++      'plain text retains selection registration and inherited selection color',
++      (tester) async {
++    await compare(tester, '可以选择的普通评论', selection: true);
++    final fast = tester.widget<RichText>(_paragraph(_fastKey));
++    final old = tester.widget<RichText>(_paragraph(_oldKey));
++    expect(fast.selectionRegistrar, isNotNull);
++    expect(old.selectionRegistrar, isNotNull);
++    expect(fast.selectionColor, old.selectionColor);
++    expect(
++        find.descendant(
++            of: find.byKey(_fastKey), matching: find.byType(MouseRegion)),
++        findsOneWidget);
++  });
++
++  testWidgets(
++      'markup entities emoji badges and whitespace retain HTML rendering',
++      (tester) async {
++    for (final emoji in [true, false]) {
++      await tester.runAsync(
++          () => GStorage.settings.put(SettingsBoxKey.showEmoji, emoji));
++      for (final source in [
++        '',
++        ' 前导',
++        '尾随 ',
++        '两个  空格',
++        '换行\n文本',
++        '回车\r文本',
++        'Tab\t文本',
++        '控制\u0000字符',
++        '分页\f字符',
++        '\u00a0不换行空格',
++        'AT&amp;T',
++        '比较 < 3',
++        '<b>加粗</b>',
++        '<a href="/u/123">用户</a>',
++        '[哈哈哈]',
++        '[楼主]',
++        '[层主]',
++        '[置顶]',
++        '[未知表情]',
++      ]) {
++        await tester
++            .pumpWidget(GetMaterialApp(home: Scaffold(body: htmlText(source))));
++        await tester.pumpAndSettle();
++        expect(find.byType(HtmlWidget), findsOneWidget, reason: source);
++        expect(tester.takeException(), isNull, reason: source);
++      }
++    }
++  });
++
++  testWidgets('long plain documents retain the existing async HTML policy',
++      (tester) async {
++    final source = '普通长文' * 2600;
++    late HtmlWidget configured;
++    await tester.pumpWidget(MaterialApp(home: Builder(builder: (context) {
++      final preserved = htmlText(source);
++      expect(preserved, isA<Builder>());
++      configured = (preserved as Builder).builder(context) as HtmlWidget;
++      return const SizedBox.shrink();
++    })));
++    expect(configured.html, source);
++    expect(configured.buildAsync, isNull,
++        reason:
++            'Keep the pinned renderer default for documents over 10000 characters.');
++  });
++
++  testWidgets('existing link callbacks and emoji widgets still execute',
++      (tester) async {
++    var replyLinks = 0;
++    var plainClicks = 0;
++    await tester.pumpWidget(GetMaterialApp(
++        home: Scaffold(
++            body: htmlText(
++      '<a href="/feed/replyList">全部回复</a> <a href="">正文入口</a> [楼主]',
++      onShowTotalReply: () => replyLinks++,
++      onClick: () => plainClicks++,
++    ))));
++    await tester.pumpAndSettle();
++    final html = tester.widget<HtmlWidget>(find.byType(HtmlWidget));
++    expect(await html.onTapUrl!('/feed/replyList'), isTrue);
++    expect(await html.onTapUrl!(''), isTrue);
++    expect(replyLinks, 1);
++    expect(plainClicks, 1);
++    expect(find.text('楼主'), findsOneWidget);
++    expect(find.byType(InlineCustomWidget), findsOneWidget);
++  });
++
++  testWidgets(
++      '20 real plain reply cards avoid 40 HTML mounts with equal heights',
++      (tester) async {
++    Future<(int, int, List<Size>)> mount(bool forceHtml) async {
++      String body(String text) => forceHtml ? '<span>$text</span>' : text;
++      await tester.pumpWidget(GetMaterialApp(
++          home: Scaffold(
++              body: SingleChildScrollView(
++        child: SizedBox(
++            width: 420,
++            child: Column(
++                children: List.generate(20, (index) {
++              final data = Datum.fromJson({
++                'id': index + 1,
++                'entityType': 'feed_reply',
++                'uid': 100 + index,
++                'feedUid': 900,
++                'message': body('普通评论 $index 关于拍照和日常续航的体验，保持文字换行和显示尺寸。'),
++                'userInfo': {'username': body('用户 $index')},
++                'userAvatar': '',
++                'dateline': DateTime.now().millisecondsSinceEpoch ~/ 1000,
++                'replynum': 0,
++                'likenum': 0,
++              })
++                ..fetchType = 'feed_reply';
++              return FeedReplyCard(key: ValueKey(index), data: data);
++            }))),
++      ))));
++      await tester.pumpAndSettle();
++      final roots = find.byType(FeedReplyCard).evaluate().toList();
++      var elements = 0;
++      void count(Element element) {
++        elements++;
++        element.visitChildElements(count);
++      }
++
++      roots.forEach(count);
++      final result = (
++        find.byType(HtmlWidget).evaluate().length,
++        elements,
++        List.generate(
++            20, (index) => tester.getSize(find.byKey(ValueKey(index))))
++      );
++      expect(tester.takeException(), isNull);
++      await tester.pumpWidget(const SizedBox.shrink());
++      return result;
++    }
++
++    final previous = await mount(true);
++    final optimized = await mount(false);
++    expect(previous.$1, 40);
++    expect(optimized.$1, 0);
++    expect(optimized.$2, lessThan(previous.$2));
++    expect(optimized.$3, previous.$3);
++    // Structural counts are deterministic; no timing threshold gates the test.
++    debugPrint('20 reply cards: HtmlWidget ${previous.$1} -> ${optimized.$1}; '
++        'elements ${previous.$2} -> ${optimized.$2}');
++  });
++}
+diff --git a/apps/flutter/test/ui/comment_render_interaction_test.dart b/apps/flutter/test/ui/comment_render_interaction_test.dart
+new file mode 100644
+--- /dev/null
++++ b/apps/flutter/test/ui/comment_render_interaction_test.dart
+@@ -0,0 +1,250 @@
++import 'dart:io';
++
++import 'package:c001apk_flutter/components/cards/feed_reply_card.dart';
++import 'package:c001apk_flutter/components/html_text.dart';
++import 'package:c001apk_flutter/logic/content_filter/app_content_filter.dart';
++import 'package:c001apk_flutter/logic/media/feed_media.dart';
++import 'package:c001apk_flutter/logic/model/feed/datum.dart';
++import 'package:c001apk_flutter/utils/storage_util.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:get/get.dart';
++import 'package:hive/hive.dart';
++
++Future<void> _mount(WidgetTester tester, Widget child,
++    {List<GetPage<dynamic>> pages = const []}) async {
++  await tester.pumpWidget(GetMaterialApp(
++    getPages: pages,
++    home: Scaffold(
++      body: Align(
++        alignment: Alignment.topLeft,
++        child: SizedBox(width: 390, child: child),
++      ),
++    ),
++  ));
++  await tester.pumpAndSettle();
++}
++
++Future<void> _tapLink(WidgetTester tester, String text) async {
++  final target = find.text(text, findRichText: true);
++  expect(target, findsOneWidget);
++  await tester.tapAt(tester.getTopLeft(target) + const Offset(5, 8));
++  await tester.pumpAndSettle();
++}
++
++Datum _reply(String message) => Datum.fromJson({
++      'id': 42,
++      'entityType': 'feed_reply',
++      'fetchType': 'feed_reply',
++      'uid': 7,
++      'feedUid': 9,
++      'userInfo': {'uid': 7, 'username': '测试用户'},
++      'message': message,
++      'replynum': 0,
++      'likenum': 0,
++      'userAvatar': '',
++    })
++      ..fetchType = 'feed_reply';
++
++void main() {
++  late Directory temporary;
++  setUpAll(() async {
++    temporary = await Directory.systemTemp.createTemp('comment-render-');
++    Hive.init(temporary.path);
++    GStorage.settings = await Hive.openBox('settings');
++    GStorage.blackList = await Hive.openBox('blackList');
++  });
++  setUp(() async {
++    AppContentFilter.service = null;
++    await GStorage.settings.clear();
++    await GStorage.blackList.clear();
++  });
++  tearDown(() {
++    Get.reset();
++    AppContentFilter.service = null;
++  });
++  tearDownAll(() async {
++    await Hive.close();
++    await temporary.delete(recursive: true);
++  });
++
++  testWidgets('HTML action links retain the three existing callbacks',
++      (tester) async {
++    final calls = <String>[];
++    await _mount(
++        tester,
++        Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
++          htmlText('<a href="">Open</a>', onClick: () => calls.add('open')),
++          htmlText('<a href="/feed/replyList?id=42">Replies</a>',
++              onShowTotalReply: () => calls.add('replies')),
++          htmlText('<a href="/contacts/fans">Fans</a>',
++              onViewFan: () => calls.add('fans')),
++        ]));
++    await _tapLink(tester, 'Open');
++    await _tapLink(tester, 'Replies');
++    await _tapLink(tester, 'Fans');
++    expect(calls, ['open', 'replies', 'fans']);
++    expect(tester.takeException(), isNull);
++  });
++
++  testWidgets('native user links keep their navigation target', (tester) async {
++    String? uid;
++    await _mount(
++        tester, htmlText('<a class="feed-link-uname" href="/u/73">Author</a>'),
++        pages: [
++          GetPage(
++              name: '/u/:uid',
++              page: () {
++                uid = Get.parameters['uid'];
++                return const Scaffold(body: Text('User destination'));
++              }),
++        ]);
++    await _tapLink(tester, 'Author');
++    expect(uid, '73');
++    expect(find.text('User destination'), findsOneWidget);
++    expect(tester.takeException(), isNull);
++  });
++
++  testWidgets('emoji and author badges remain visual and honor the setting',
++      (tester) async {
++    const source = 'Comment [哈哈哈] [楼主] [层主] [置顶]';
++    await _mount(tester, htmlText(source));
++    expect(find.text('楼主'), findsOneWidget);
++    expect(find.text('层主'), findsOneWidget);
++    expect(find.text('置顶'), findsOneWidget);
++    final emoji = tester.widgetList<Image>(find.byType(Image)).single;
++    expect((emoji.image as AssetImage).assetName,
++        'assets/emojis/coolapk_emotion_1_hahaha.png');
++    expect(emoji.width, 19.5);
++    expect(emoji.height, 19.5);
++    await tester
++        .runAsync(() => GStorage.settings.put(SettingsBoxKey.showEmoji, false));
++    await _mount(tester, htmlText(source));
++    expect(find.byType(Image), findsNothing);
++    expect(find.text(source, findRichText: true), findsOneWidget);
++    expect(tester.takeException(), isNull);
++  });
++
++  testWidgets('picture link preserves original URLs and gallery metadata',
++      (tester) async {
++    const first = 'https://image.coolapk.com/first@4032x3024.jpg';
++    const second = 'https://image.coolapk.com/second@3325x2494.jpg';
++    const media = FeedMedia(
++        sourceUrl: second,
++        previewUrl: 'https://image.coolapk.com/preview@320x240.jpg',
++        videoUrl: 'https://image.coolapk.com/motion.mov',
++        isLivePhoto: true,
++        isHdr: true,
++        contentId: '42',
++        contentType: MediaContentType.reply);
++    Map<dynamic, dynamic>? arguments;
++    await _mount(
++        tester,
++        htmlText('<a href="$second">Picture</a>',
++            picArr: const [first, second],
++            mediaItems: const [media],
++            contentId: '42',
++            contentType: MediaContentType.reply),
++        pages: [
++          GetPage(
++              name: '/imageview',
++              page: () {
++                arguments = Get.arguments as Map;
++                return const Scaffold(body: Text('Gallery destination'));
++              }),
++        ]);
++    await _tapLink(tester, 'Picture');
++    expect(arguments?['imgList'], [first, second]);
++    expect(arguments?['initialPage'], 1);
++    final items = arguments?['mediaItems'] as List<FeedMedia>;
++    expect(identical(items[1], media), isTrue);
++    expect(items[1].originalUrl, second);
++    expect(items[1].previewUrl, media.previewUrl);
++    expect(items[0].contentId, '42');
++    expect(items[0].contentType, MediaContentType.reply);
++    expect(tester.takeException(), isNull);
++  });
++
++  testWidgets('body-only picture links retain the full source image',
++      (tester) async {
++    const url = 'https://image.coolapk.com/body@6000x4000.jpg';
++    Map<dynamic, dynamic>? arguments;
++    await _mount(
++        tester,
++        htmlText('<a href="$url">Image</a>',
++            contentId: '63', contentType: MediaContentType.reply),
++        pages: [
++          GetPage(
++              name: '/imageview',
++              page: () {
++                arguments = Get.arguments as Map;
++                return const Scaffold(body: Text('Gallery destination'));
++              }),
++        ]);
++    await _tapLink(tester, 'Image');
++    expect(arguments?['imgList'], [url]);
++    expect(arguments?['initialPage'], 0);
++    final item = (arguments?['mediaItems'] as List<FeedMedia>).single;
++    expect(item.sourceUrl, url);
++    expect(item.originalUrl, url);
++    expect(item.contentId, '63');
++    expect(item.contentType, MediaContentType.reply);
++  });
++
++  testWidgets('plain comment still responds to reply taps and long press',
++      (tester) async {
++    const body = '这是一条普通评论';
++    final replies = <List<dynamic>>[];
++    String? copiedText;
++    await _mount(
++        tester,
++        FeedReplyCard(
++          data: _reply(body),
++          onReply: (id, username, parent) =>
++              replies.add([id, username, parent]),
++        ),
++        pages: [
++          GetPage(
++              name: '/copy',
++              page: () {
++                copiedText = Get.parameters['text'];
++                return const Scaffold(body: Text('Copy destination'));
++              }),
++        ]);
++    await tester.tap(find.text(body, findRichText: true));
++    await tester.pumpAndSettle();
++    expect(replies, [
++      [42, '测试用户', null]
++    ]);
++    await tester.longPress(find.text(body, findRichText: true));
++    await tester.pumpAndSettle();
++    expect(copiedText, body);
++    expect(find.text('Copy destination'), findsOneWidget);
++    expect(replies.length, 1);
++    expect(tester.takeException(), isNull);
++  });
++
++  testWidgets('comment link taps navigate without triggering the reply action',
++      (tester) async {
++    var replies = 0;
++    String? uid;
++    await _mount(
++        tester,
++        FeedReplyCard(
++          data: _reply('<a href="/u/73">Linked author</a>'),
++          onReply: (_, __, ___) => replies++,
++        ),
++        pages: [
++          GetPage(
++              name: '/u/:uid',
++              page: () {
++                uid = Get.parameters['uid'];
++                return const Scaffold(body: Text('User destination'));
++              }),
++        ]);
++    await _tapLink(tester, 'Linked author');
++    expect(uid, '73');
++    expect(replies, 0);
++    expect(tester.takeException(), isNull);
 +  });
 +}
