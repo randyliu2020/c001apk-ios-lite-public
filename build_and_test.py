@@ -47,7 +47,7 @@ bundle_id = 'org.randy.coolapk.displaytests'
 architecture = run('uname', '-m')
 assert architecture in ('arm64', 'x86_64')
 run(clang, '-target', f'{architecture}-apple-ios17.0-simulator',
-    '-isysroot', sim_sdk, *common, '-DCD_TESTING=1',
+    '-isysroot', sim_sdk, *common, '-framework', 'CoreGraphics', '-DCD_TESTING=1',
     'CoolapkDisplay.m', 'DisplayTests.m', '-o', app / 'DisplayTests')
 (app / 'Info.plist').write_bytes(plistlib.dumps({
     'CFBundleIdentifier': bundle_id, 'CFBundleExecutable': 'DisplayTests',
