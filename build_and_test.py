@@ -70,10 +70,13 @@ run(clang, '-target', f'{architecture}-apple-ios17.0-simulator',
 run('codesign', '--force', '--sign', '-', app)
 devices = json.loads(run('xcrun', 'simctl', 'list', 'devices', 'available', '--json'))
 choices = [(runtime, item) for runtime, items in devices['devices'].items()
-           if '.iOS-' in runtime for item in items if item.get('isAvailable')
+           if runtime == 'com.apple.CoreSimulator.SimRuntime.iOS-27-0'
+           for item in items if item.get('isAvailable')
            and item['name'].startswith('iPhone')]
-assert choices, 'No available iPhone simulator'
-runtime, device = sorted(choices, key=lambda item: (item[0], 'Pro Max' in item[1]['name']), reverse=True)[0]
+assert choices, 'The verified standard iOS 27.0 simulator runtime is required'
+preferred = {'iPhone 16 Pro Max': 3, 'iPhone 17': 2, 'iPhone 17 Pro Max': 1}
+runtime, device = max(choices, key=lambda item: preferred.get(item[1]['name'], 0))
+print(f'Selected standard simulator: {runtime} / {device["name"]}', flush=True)
 udid = device['udid']
 if device['state'] != 'Booted':
     run('xcrun', 'simctl', 'boot', udid)
