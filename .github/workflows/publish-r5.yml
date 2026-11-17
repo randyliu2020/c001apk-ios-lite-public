@@ -1,0 +1,116 @@
+name: Publish verified r5 IPA
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/publish-r5.yml']
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-ios-lite-r5
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_COMMIT: d67575e34a3957f92bc188f38226408ccde3141f
+      BUILD_RUN: '43881802808'
+      ARTIFACT_ID: '14235423008'
+      RELEASE_TAG: ios-lite-r5-20261116.5
+      IPA_NAME: c001apk-lite-1.5.2+20261116.5-ios-arm64-unsigned.ipa
+    steps:
+      - name: Download and verify the existing successful build
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN" > build-run.json
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID" > artifact-info.json
+          python3 - <<'PY'
+          import json, os
+          run = json.load(open('build-run.json'))
+          artifact = json.load(open('artifact-info.json'))
+          assert run['status'] == 'completed' and run['conclusion'] == 'success'
+          assert run['head_sha'] == os.environ['SOURCE_COMMIT']
+          assert artifact['name'] == 'c001apk-lite-ios-arm64-unsigned'
+          assert not artifact['expired']
+          assert artifact['workflow_run']['id'] == int(os.environ['BUILD_RUN'])
+          assert artifact['workflow_run']['head_sha'] == os.environ['SOURCE_COMMIT']
+          assert artifact['digest'] == 'sha256:00fb39fabd40bd0779ba2c523dea9dc2b38fa7fd49bcabd20edac1efd5764bbc'
+          PY
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID/zip" > artifact.zip
+          python3 - <<'PY'
+          import hashlib, json, os, plistlib, zipfile
+          from pathlib import Path
+          raw = Path('artifact.zip').read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == '00fb39fabd40bd0779ba2c523dea9dc2b38fa7fd49bcabd20edac1efd5764bbc'
+          ipa_name = os.environ['IPA_NAME']
+          with zipfile.ZipFile('artifact.zip') as z:
+              assert z.testzip() is None
+              assert set(z.namelist()) == {ipa_name, 'SHA256SUMS.txt', 'provenance.json'}
+              for name in [ipa_name, 'SHA256SUMS.txt', 'provenance.json']:
+                  Path(name).write_bytes(z.read(name))
+          digest = hashlib.sha256(Path(ipa_name).read_bytes()).hexdigest()
+          assert digest == '3e5eb926fb657caaf88b0891b5f04a3ed007974fc90b2956955315e76f6fed16'
+          info = json.load(open('provenance.json'))
+          assert info['sha256'] == digest
+          assert info['source_revision'] == os.environ['SOURCE_COMMIT']
+          assert info['build_number'] == '20261116.5'
+          assert info['version'] == '1.5.2'
+          assert info['bundle_identifier'] == 'com.randyliu2020.c001apk.lite'
+          assert info['architectures'] == ['arm64'] and info['platform'] == 'iPhoneOS'
+          assert len(info['binaries']) == 19 and info['requires_user_signing']
+          with zipfile.ZipFile(ipa_name) as z:
+              assert z.testzip() is None
+              p = plistlib.loads(z.read('Payload/Runner.app/Info.plist'))
+              assert p['CFBundleVersion'] == '20261116.5'
+              assert p['CFBundleIdentifier'] == 'com.randyliu2020.c001apk.lite'
+          print('Verified existing r5 IPA SHA256:', digest)
+          PY
+      - name: Publish the verified IPA as a public download
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'This release already exists; refusing to replace any assets.'
+            exit 1
+          fi
+          cat > release-notes.txt <<'NOTES'
+          c001apk iOS 精简版 r5（1.5.2 / 20261116.5）
+          
+          下载下方 .ipa 文件，在全能签中使用自己的有效证书签名安装。
+          本包未签名，不能直接点击安装；沿用原应用标识和证书以尝试覆盖安装。
+          
+          本次减少关闭过滤时的重复正文解析，以及普通纯文本的 Markdown 解析开销。
+          保留图片清晰度、图片放大动画、下滑关闭、边缘返回、切图和缩放。
+          构建及离线测试通过，7 项 iOS 27 模拟器触摸测试通过；真机流畅度需安装后验证。
+          
+          构建记录：https://github.com/randyliu2020/c001apk-ios-lite-public/actions/runs/43881802808
+          源码与复现：https://github.com/randyliu2020/c001apk-ios-lite-public/tree/d67575e34a3957f92bc188f38226408ccde3141f
+          基于 TG-Twilight/c001apk 的公开实现，源码及修改遵循 AGPLv3。
+          
+          IPA SHA256：3e5eb926fb657caaf88b0891b5f04a3ed007974fc90b2956955315e76f6fed16
+          NOTES
+          gh release create "$RELEASE_TAG" --target "$SOURCE_COMMIT" --draft \
+            --title "c001apk iOS 精简版 r5 · 20261116.5" --notes-file release-notes.txt \
+            "$IPA_NAME" SHA256SUMS.txt provenance.json
+          release_id=$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)
+          gh api "repos/$GH_REPO/releases/$release_id" > release.json
+          python3 - <<'PY'
+          import json, os
+          r = json.load(open('release.json'))
+          assert r['draft'] and r['tag_name'] == os.environ['RELEASE_TAG']
+          assets = {a['name']: a for a in r['assets']}
+          assert set(assets) == {os.environ['IPA_NAME'], 'SHA256SUMS.txt', 'provenance.json'}
+          ipa = assets[os.environ['IPA_NAME']]
+          assert ipa['state'] == 'uploaded' and ipa['size'] == 13659720
+          assert ipa['digest'] == 'sha256:3e5eb926fb657caaf88b0891b5f04a3ed007974fc90b2956955315e76f6fed16'
+          PY
+          gh release edit "$RELEASE_TAG" --draft=false
+          gh release view "$RELEASE_TAG" --json url,assets
